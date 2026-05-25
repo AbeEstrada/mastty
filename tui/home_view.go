@@ -424,6 +424,7 @@ func (v *HomeView) HandleKey(key vaxis.Key) {
 			}
 		case "close":
 			v.showingLinks = false
+			v.focusedView = 0
 		}
 		return
 	}
