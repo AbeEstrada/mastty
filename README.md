@@ -99,12 +99,14 @@ If authentication fails:
 
 ### Timeline
 
-| Key | Action                                                |
-| --- | ----------------------------------------------------- |
-| `j` | Move to next status                                   |
-| `k` | Move to previous status                               |
-| `g` | Jump to first status                                  |
-| `G` | Jump to last status                                   |
-| `O` | Open status with original URL in browser              |
-| `o` | Open status in current server instance URL in browser |
-| `v` | Open card URL in browser                              |
+| Key      | Action                                                |
+| -------- | ----------------------------------------------------- |
+| `j`      | Move to next status                                   |
+| `k`      | Move to previous status                               |
+| `ctrl+d` | Scroll down one page                                  |
+| `ctrl+u` | Scroll up one page                                    |
+| `g`      | Jump to first status                                  |
+| `G`      | Jump to last status                                   |
+| `O`      | Open status with original URL in browser              |
+| `o`      | Open status in current server instance URL in browser |
+| `v`      | Open card URL in browser                              |

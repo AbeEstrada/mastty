@@ -142,6 +142,22 @@ func (v *TimelineView) HandleKey(key vaxis.Key) {
 		} else {
 			newIndex--
 		}
+	case key.MatchString("Ctrl+d"):
+		_, height := v.app.vx.Window().Size()
+		jump := height / 2
+		if currentIndex == -1 {
+			newIndex = jump
+		} else {
+			newIndex += jump
+		}
+	case key.MatchString("Ctrl+u"):
+		_, height := v.app.vx.Window().Size()
+		jump := height / 2
+		if currentIndex == -1 {
+			newIndex = 0
+		} else {
+			newIndex -= jump
+		}
 	case key.Matches('g'):
 		newIndex = 0
 	case key.Matches('G'):
