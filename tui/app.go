@@ -176,6 +176,10 @@ func (app *App) RequestQuit() {
 }
 
 func (app *App) handleKeyEvent(key vaxis.Key) {
+	if key.EventType == vaxis.EventRelease {
+		return
+	}
+
 	if app.showQuit {
 		if key.Matches('y') || key.Matches(vaxis.KeyEnter) {
 			app.running = false
