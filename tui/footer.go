@@ -4,22 +4,15 @@ import (
 	"git.sr.ht/~rockorager/vaxis"
 )
 
-type Footer struct {
-	text string
+// Footer draws the last row of the screen. The App decides what it shows: a
+// confirmation prompt, a transient message, or the loading indicator.
+type Footer struct{}
+
+func CreateFooter() *Footer {
+	return &Footer{}
 }
 
-func CreateFooter(vx *vaxis.Vaxis) *Footer {
-	return &Footer{
-		text: "",
-	}
-}
-
-func (f *Footer) SetText(text string) {
-	f.text = text
-}
-
-func (f *Footer) Draw(win vaxis.Window) {
+func (f *Footer) Draw(win vaxis.Window, segs ...vaxis.Segment) {
 	_, height := win.Size()
-	y := height - 1
-	win.Println(y, vaxis.Segment{Text: f.text})
+	win.Println(height-1, segs...)
 }

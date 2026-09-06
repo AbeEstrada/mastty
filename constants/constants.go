@@ -1,7 +1,9 @@
 package constants
 
 const (
-	AppName    = "Tuit"
-	AppVersion = "1.0.0"
-	AppUrl     = "https://github.com/AbeEstrada/tuit"
+	AppName = "Tuit"
+	AppUrl  = "https://github.com/AbeEstrada/tuit"
 )
+
+// AppVersion is overridden at build time by the justfile through -ldflags -X.
+var AppVersion = "dev"

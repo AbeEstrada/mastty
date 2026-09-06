@@ -1,11 +1,9 @@
 package auth
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
-	"log"
-	"net/url"
 	"os"
 	"strings"
 
@@ -14,14 +12,22 @@ import (
 	"github.com/mattn/go-mastodon"
 )
 
-func SetupAuth() {
-	var server string
-	fmt.Print("Enter the URL of your Mastodon server: ")
-	fmt.Scanln(&server)
-	server = strings.TrimSpace(server)
-	if !strings.HasPrefix(server, "https://") {
+// SetupAuth runs the interactive OAuth flow on the terminal, saves the
+// resulting credentials, and returns the loaded config.
+func SetupAuth() (*config.Config, error) {
+	in := bufio.NewReader(os.Stdin)
+
+	server, err := prompt(in, "Enter the URL of your Mastodon server: ")
+	if err != nil {
+		return nil, err
+	}
+	if server == "" {
+		return nil, fmt.Errorf("no server given")
+	}
+	if !strings.Contains(server, "://") {
 		server = "https://" + server
 	}
+	server = strings.TrimRight(server, "/")
 
 	appConfig := &mastodon.AppConfig{
 		ClientName:   constants.AppName,
@@ -31,35 +37,33 @@ func SetupAuth() {
 		RedirectURIs: "urn:ietf:wg:oauth:2.0:oob",
 	}
 
-	app, err := mastodon.RegisterApp(context.Background(), appConfig)
+	ctx := context.Background()
+	app, err := mastodon.RegisterApp(ctx, appConfig)
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("registering app with %s: %w", server, err)
 	}
 
-	u, err := url.Parse(app.AuthURI)
+	fmt.Println("Open this URL in your browser and authorize the app:")
+	fmt.Println(app.AuthURI)
+
+	authCode, err := prompt(in, "Paste the authorization code here: ")
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	fmt.Println("Open your browser and copy/paste the given authorization code:")
-	fmt.Println(u)
+	if authCode == "" {
+		return nil, fmt.Errorf("no authorization code given")
+	}
 
-	var authCode string
-	fmt.Print("Paste the code here: ")
-	fmt.Scanln(&authCode)
-
-	mastodonConfig := &mastodon.Config{
+	client := mastodon.NewClient(&mastodon.Config{
 		Server:       server,
 		ClientID:     app.ClientID,
 		ClientSecret: app.ClientSecret,
+	})
+	if err := client.GetUserAccessToken(ctx, authCode, app.RedirectURI); err != nil {
+		return nil, fmt.Errorf("exchanging authorization code: %w", err)
 	}
 
-	client := mastodon.NewClient(mastodonConfig)
-	err = client.GetUserAccessToken(context.Background(), authCode, app.RedirectURI)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	newConfig := config.Config{
+	cfg := &config.Config{
 		Auth: config.ConfigAuth{
 			Server:       client.Config.Server,
 			ClientID:     client.Config.ClientID,
@@ -67,21 +71,18 @@ func SetupAuth() {
 			AccessToken:  client.Config.AccessToken,
 		},
 	}
-	jsonData, err := json.MarshalIndent(newConfig, "", "    ")
-	if err != nil {
-		fmt.Printf("Error marshalling data: %v\n", err)
-		return
+	if err := config.Save(cfg); err != nil {
+		return nil, err
 	}
-	configDir := config.GetConfigDir()
-	err = os.MkdirAll(configDir, 0755)
-	if err != nil {
-		fmt.Printf("Error creating directory %s: %v\n", configDir, err)
-		return
+	fmt.Printf("Credentials saved to %s\n", config.GetConfigFile())
+	return cfg, nil
+}
+
+func prompt(in *bufio.Reader, label string) (string, error) {
+	fmt.Print(label)
+	line, err := in.ReadString('\n')
+	if err != nil && line == "" {
+		return "", fmt.Errorf("reading input: %w", err)
 	}
-	configFile := config.GetConfigFile()
-	err = os.WriteFile(configFile, jsonData, 0644)
-	if err != nil {
-		fmt.Printf("Error writing file: %v\n", err)
-		return
-	}
+	return strings.TrimSpace(line), nil
 }

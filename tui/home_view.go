@@ -2,35 +2,67 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sort"
+	"strings"
+	"time"
 
 	"git.sr.ht/~rockorager/vaxis"
 	"github.com/AbeEstrada/tuit/utils"
 	"github.com/mattn/go-mastodon"
 )
 
+const (
+	streamInitialBackoff = time.Second
+	streamMaxBackoff     = time.Minute
+	reloadLimit          = 40
+	pageLimit            = 20
+)
+
 type HomeView struct {
-	app            *App
-	timeline       *TimelineView
-	statusView     *StatusView
-	accountView    *AccountView
-	linksView      *LinksView
-	focusedView    int
-	isStreaming    bool
-	showingLinks   bool
-	lastSelectedID mastodon.ID
+	app              *App
+	timeline         *TimelineView
+	statusView       *StatusView
+	accountView      *AccountView
+	notificationView *NotificationView
+	linksView        *LinksView
+	picker           *PickerView
+	vote             *pollVote
+	relationships    map[mastodon.ID]*mastodon.Relationship
+	focusedView      int
+	showingLinks     bool
+	lastSelectedID   mastodon.ID
+
+	// roots holds every root timeline fetched so far, by title, so switching
+	// between them is instant. Streaming keeps the home and notification roots
+	// fresh even while another root is shown.
+	roots                  map[string]*Timeline
+	lastMarkedNotification mastodon.ID
+
+	// Layout of the last Draw in screen coordinates, for mouse hit testing.
+	bodyLeft, bodyTop, bodyWidth, bodyHeight, split int
+
+	streamCancel context.CancelFunc
+	// streamBroken is set when the stream dropped; the next event triggers a
+	// backfill of whatever was missed.
+	streamBroken bool
 }
 
 func CreateHomeView() *HomeView {
+	statusView := CreateStatusView()
+	accountView := CreateAccountView()
 	v := &HomeView{
-		statusView:  CreateStatusView(),
-		accountView: CreateAccountView(),
-		linksView:   CreateLinksView(),
-		focusedView: 0,
+		statusView:       statusView,
+		accountView:      accountView,
+		notificationView: CreateNotificationView(statusView, accountView),
+		linksView:        CreateLinksView(),
+		roots:            make(map[string]*Timeline),
+		relationships:    make(map[mastodon.ID]*mastodon.Relationship),
 	}
+	accountView.Relationships = v.relationships
 	timelineView := CreateTimelineView()
-	timelineView.onLoadMore = v.loadMoreTimeline
+	timelineView.onLoadMore = v.loadMore
 	v.timeline = timelineView
 
 	return v
@@ -44,291 +76,426 @@ func (v *HomeView) SetApp(app *App) {
 }
 
 func (v *HomeView) OnActivate() {
-	go v.getHomeTimeline()
-	go v.startStreaming()
-	v.app.header.SetText("Home")
+	v.showRoot(homeSource())
+	v.startStreaming()
 }
 
-func (v *HomeView) getHomeTimeline() {
-	v.app.SetLoading(true)
-
-	statuses, err := v.app.client.GetTimelineHome(context.Background(), nil)
-	if err == nil {
-		items := make([]TimelineItem, len(statuses))
-		for i, s := range statuses {
-			items[i] = StatusItem{Status: s}
-		}
-		v.timeline.AddTimeline(items, nil, nil)
-		v.app.vx.PostEvent(vaxis.Redraw{})
+// Close stops the streaming connection.
+func (v *HomeView) Close() {
+	if v.streamCancel != nil {
+		v.streamCancel()
+		v.streamCancel = nil
 	}
-
-	v.app.SetLoading(false)
 }
 
-func (v *HomeView) getStatusContext() {
-	selectedItem := v.timeline.SelectedItem()
-
-	item, ok := selectedItem.(StatusItem)
-	if !ok || item.Status == nil {
-		return
+// FocusLabel names the pane that receives navigation keys.
+func (v *HomeView) FocusLabel() string {
+	switch {
+	case v.focusedView == 0:
+		return "timeline"
+	case v.showingLinks:
+		return "links"
+	default:
+		return "detail"
 	}
+}
 
-	original := item.Status
-
-	if original.Reblog != nil {
-		original = original.Reblog
-	}
-
-	v.app.SetLoading(true)
-
-	if original.ID != "" {
-		ctx, err := v.app.client.GetStatusContext(context.Background(), original.ID)
-
-		if err == nil {
-			items := make([]TimelineItem, 0, len(ctx.Ancestors)+1+len(ctx.Descendants))
-
-			for _, status := range ctx.Ancestors {
-				items = append(items, StatusItem{Status: status})
-			}
-
-			items = append(items, StatusItem{Status: original})
-
-			for _, status := range ctx.Descendants {
-				items = append(items, StatusItem{Status: status})
-			}
-
-			v.timeline.AddTimeline(items, StatusItem{Status: original}, nil)
-			v.app.vx.PostEvent(vaxis.Redraw{})
+// selectedStatus returns the status behind the selection: the status itself,
+// or the one a notification refers to.
+func (v *HomeView) selectedStatus() *mastodon.Status {
+	switch item := v.timeline.SelectedItem().(type) {
+	case StatusItem:
+		return item.Status
+	case NotificationItem:
+		if item.Notification != nil {
+			return item.Status
 		}
 	}
-
-	v.app.SetLoading(false)
+	return nil
 }
 
-func (v *HomeView) reloadHomeTimeline() {
-	v.app.SetLoading(true)
-
-	index := 0 // Home
-	if index >= len(v.timeline.timelines) {
-		v.app.SetLoading(false)
+// showRoot replaces the navigation stack with a root timeline, reusing an
+// already fetched one when available.
+func (v *HomeView) showRoot(source Source) {
+	title := source.Title()
+	if root := v.timeline.Root(); root != nil && v.timeline.Depth() == 1 && root.Title() == title {
 		return
 	}
-
-	timeline := &v.timeline.timelines[index]
-	items := timeline.Items
-
-	if len(items) == 0 {
-		v.app.SetLoading(false)
-		return
+	t, cached := v.roots[title]
+	if !cached {
+		t = v.timeline.NewTimeline(source)
+		v.roots[title] = t
 	}
-
-	var sinceID mastodon.ID
-	if firstItem, ok := items[0].(StatusItem); ok && firstItem.Status != nil {
-		sinceID = firstItem.Status.ID
-	} else {
-		v.app.SetLoading(false)
-		return
+	v.showingLinks = false
+	v.focusedView = 0
+	v.timeline.SetRoot(t)
+	switch {
+	case !cached:
+		v.fetch(t, nil)
+	case title == titleNotifications:
+		v.markNotificationsRead(t)
 	}
+}
 
-	newStatuses, err := v.app.client.GetTimelineHome(context.Background(), &mastodon.Pagination{
-		SinceID: sinceID,
-		Limit:   40,
+// push shows a new timeline on top of the current one and loads it.
+func (v *HomeView) push(source Source, selected TimelineItem) {
+	t := v.timeline.NewTimeline(source)
+	v.showingLinks = false
+	v.timeline.Push(t)
+	v.fetch(t, selected)
+}
+
+func (v *HomeView) pop() bool {
+	if !v.timeline.Pop() {
+		return false
+	}
+	v.showingLinks = false
+	return true
+}
+
+// fetch loads the first page of a timeline and installs it.
+func (v *HomeView) fetch(t *Timeline, selected TimelineItem) {
+	client := v.app.client
+	load(v.app, func(ctx context.Context) ([]TimelineItem, error) {
+		return t.Source.Fetch(ctx, client)
+	}, func(items []TimelineItem) {
+		t.SetItems(items, selected)
+		if v.timeline.Current() == t {
+			v.timeline.afterChange(t)
+		}
+		if t.Title() == titleNotifications {
+			v.markNotificationsRead(t)
+		}
 	})
-
-	if err == nil && len(newStatuses) > 0 {
-		newItems := make([]TimelineItem, len(newStatuses))
-		for i, s := range newStatuses {
-			newItems[i] = StatusItem{Status: s}
-		}
-		v.timeline.PrependToTimeline(index, newItems)
-		v.app.vx.PostEvent(vaxis.Redraw{})
-	}
-	v.app.SetLoading(false)
 }
 
-func (v *HomeView) loadMoreTimeline() {
-	v.app.SetLoading(true)
-
-	index := v.timeline.index
-	if index >= len(v.timeline.timelines) {
-		v.app.SetLoading(false)
-		return
-	}
-
-	timeline := &v.timeline.timelines[index]
-	items := timeline.Items
-
-	if len(items) == 0 {
-		v.app.SetLoading(false)
-		return
-	}
-
-	var maxID mastodon.ID
-	if lastItem, ok := items[len(items)-1].(StatusItem); ok && lastItem.Status != nil {
-		maxID = lastItem.Status.ID
-	} else {
-		v.app.SetLoading(false)
-		return
-	}
-
-	var newStatuses []*mastodon.Status
-	var err error
-
-	if index == 0 {
-		newStatuses, err = v.app.client.GetTimelineHome(context.Background(), &mastodon.Pagination{
-			MaxID: maxID,
-			Limit: 20,
-		})
-	} else if timeline.Account != nil {
-		newStatuses, err = v.app.client.GetAccountStatuses(context.Background(), timeline.Account.ID, &mastodon.Pagination{
-			MaxID: maxID,
-			Limit: 20,
-		})
-	}
-
-	if err == nil && len(newStatuses) > 0 {
-		newItems := make([]TimelineItem, len(newStatuses))
-		for i, s := range newStatuses {
-			newItems[i] = StatusItem{Status: s}
-		}
-		v.timeline.AppendToTimeline(index, newItems)
-		v.app.vx.PostEvent(vaxis.Redraw{})
-	}
-
-	v.app.SetLoading(false)
+// reload fetches newer items for the current timeline, or refetches it from
+// the top when the source cannot page forward.
+func (v *HomeView) reload() {
+	v.reloadTimeline(v.timeline.Current())
 }
 
-func (v *HomeView) goToAccountTimeline(currentUser bool) {
-	selectedItem := v.timeline.SelectedItem()
-
-	item, ok := selectedItem.(StatusItem)
-	if !ok || item.Status == nil {
+func (v *HomeView) reloadTimeline(t *Timeline) {
+	if t == nil {
 		return
 	}
-	original := item.Status
+	client := v.app.client
+	sinceID, hasSince := t.NewestID()
 
-	if original.Reblog != nil {
-		original = original.Reblog
+	type result struct {
+		items []TimelineItem
+		newer bool
 	}
+	load(v.app, func(ctx context.Context) (result, error) {
+		if hasSince {
+			items, ok, err := t.Source.Newer(ctx, client, sinceID)
+			if ok {
+				return result{items: items, newer: true}, err
+			}
+		}
+		items, err := t.Source.Fetch(ctx, client)
+		return result{items: items}, err
+	}, func(r result) {
+		if r.newer {
+			t.Prepend(r.items)
+		} else {
+			t.SetItems(r.items, nil)
+			if v.timeline.Current() == t {
+				v.timeline.afterChange(t)
+			}
+		}
+		if t.Title() == titleNotifications && len(r.items) > 0 {
+			v.markNotificationsRead(t)
+		}
+	})
+}
 
+// loadMore fetches the next older page of the current timeline.
+func (v *HomeView) loadMore() {
+	t := v.timeline.Current()
+	if t == nil || t.exhausted {
+		return
+	}
+	client := v.app.client
+	load(v.app, func(ctx context.Context) ([]TimelineItem, error) {
+		return t.Source.LoadMore(ctx, client)
+	}, func(items []TimelineItem) {
+		if len(items) == 0 {
+			t.exhausted = true
+			return
+		}
+		t.Append(items)
+	})
+}
+
+func (v *HomeView) openThread() {
+	status := v.selectedStatus()
+	if status == nil {
+		return
+	}
+	original := originalStatus(status)
 	if original.ID == "" {
 		return
 	}
+	v.push(newThreadSource(original), StatusItem{Status: original})
+}
 
-	v.app.SetLoading(true)
-
-	var account *mastodon.Account
-	var err error
-
-	if currentUser {
-		account, err = v.app.client.GetAccountCurrentUser(context.Background())
-	} else {
-		account, err = v.app.client.GetAccount(context.Background(), original.Account.ID)
+// openProfile pushes the timeline of the selected item's account, or the
+// user's own when own is set.
+func (v *HomeView) openProfile(own bool) {
+	account := v.selectedAccount()
+	if own {
+		account = v.app.currentAccount
 	}
+	if account == nil {
+		return
+	}
+	if current := v.timeline.Current(); current != nil && current.Title() == "@"+account.Acct {
+		return
+	}
+	v.push(accountSource(account), nil)
+	v.fetchRelationship(account.ID)
+}
 
-	if err == nil {
-		statuses, err := v.app.client.GetAccountStatuses(context.Background(), account.ID, &mastodon.Pagination{})
-		if err == nil {
-			items := make([]TimelineItem, 0, len(statuses)+1)
+// markNotificationsRead tells the server the newest notification has been
+// seen and clears the badge.
+func (v *HomeView) markNotificationsRead(t *Timeline) {
+	newest, ok := t.NewestID()
+	if !ok || newest == v.lastMarkedNotification {
+		return
+	}
+	v.lastMarkedNotification = newest
+	v.app.header.SetBadge(0)
 
-			items = append(items, AccountItem{Account: account})
-
-			for _, s := range statuses {
-				items = append(items, StatusItem{Status: s})
-			}
-
-			v.timeline.AddTimeline(items, StatusItem{Status: original}, account)
+	client := v.app.customClient
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		defer cancel()
+		if err := client.SetNotificationsMarker(ctx, newest); err != nil {
+			log.Printf("Failed to set notifications marker: %v", err)
+			return
 		}
-	}
+		v.app.fetchUnreadNotifications(client)
+	}()
+}
 
-	v.app.SetLoading(false)
+func (v *HomeView) promptHashtag() {
+	v.app.PromptInput("Hashtag: #", "", func(text string) {
+		tag := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(text), "#"))
+		if tag != "" {
+			v.push(hashtagSource(tag), nil)
+		}
+	})
+}
+
+func (v *HomeView) promptSearch() {
+	v.app.PromptInput("Search: ", "", func(text string) {
+		query := strings.TrimSpace(text)
+		if query == "" {
+			return
+		}
+		if strings.HasPrefix(query, "#") && !strings.ContainsAny(query, " \t") {
+			v.push(hashtagSource(strings.TrimPrefix(query, "#")), nil)
+			return
+		}
+		v.push(&searchSource{query: query}, nil)
+	})
+}
+
+func (v *HomeView) pickList() {
+	client := v.app.client
+	load(v.app, func(ctx context.Context) ([]*mastodon.List, error) {
+		return client.GetLists(ctx)
+	}, func(lists []*mastodon.List) {
+		if len(lists) == 0 {
+			v.app.Flash("You have no lists")
+			return
+		}
+		titles := make([]string, len(lists))
+		for i, list := range lists {
+			titles[i] = list.Title
+		}
+		v.picker = NewPicker("Lists", titles, func(index int) {
+			v.push(listSource(lists[index]), nil)
+		})
+	})
 }
 
 func (v *HomeView) startStreaming() {
-	ctx := context.Background()
-
-	events, err := v.app.client.StreamingUser(ctx)
-	if err != nil {
-		log.Printf("Failed to start streaming: %v", err)
+	if v.streamCancel != nil {
 		return
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	v.streamCancel = cancel
+	go v.runStream(ctx, v.app.client)
+}
 
-	v.isStreaming = true
-
-	for {
-		select {
-		case event := <-events:
-			v.handleStreamingEvent(event)
-		case <-ctx.Done():
-			v.isStreaming = false
+// runStream keeps a user stream open, backing off exponentially between
+// failed connections. go-mastodon reconnects on its own without any delay, so
+// each connection is cancelled on error and reopened here instead.
+func (v *HomeView) runStream(ctx context.Context, client *mastodon.Client) {
+	backoff := streamInitialBackoff
+	for ctx.Err() == nil {
+		received := v.streamOnce(ctx, client)
+		if ctx.Err() != nil {
 			return
+		}
+		if received {
+			backoff = streamInitialBackoff
+		}
+		v.app.Sync(func() { v.streamBroken = true })
+
+		log.Printf("streaming: reconnecting in %s", backoff)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return
+		}
+		if backoff < streamMaxBackoff {
+			backoff *= 2
 		}
 	}
 }
 
+// streamOnce consumes one streaming connection until it fails and reports
+// whether any event arrived on it.
+func (v *HomeView) streamOnce(ctx context.Context, client *mastodon.Client) bool {
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	events, err := client.StreamingUser(connCtx)
+	if err != nil {
+		log.Printf("streaming: %v", err)
+		return false
+	}
+
+	received := false
+	for event := range events {
+		if connCtx.Err() != nil {
+			// Drain until go-mastodon notices the cancellation and closes the channel.
+			continue
+		}
+		if e, ok := event.(*mastodon.ErrorEvent); ok {
+			log.Printf("streaming error: %v", e.Error())
+			cancel()
+			continue
+		}
+		received = true
+		v.app.Sync(func() { v.handleStreamingEvent(event) })
+	}
+	return received
+}
+
+// forEachTimeline visits every root and every timeline on the stack once.
+func (v *HomeView) forEachTimeline(fn func(*Timeline)) {
+	seen := make(map[*Timeline]bool, len(v.roots))
+	for _, t := range v.roots {
+		seen[t] = true
+		fn(t)
+	}
+	for _, t := range v.timeline.Stack() {
+		if !seen[t] {
+			fn(t)
+		}
+	}
+}
+
+// replaceStatusEverywhere applies an updated status to every timeline.
+func (v *HomeView) replaceStatusEverywhere(status *mastodon.Status) {
+	if status == nil {
+		return
+	}
+	v.forEachTimeline(func(t *Timeline) { t.ReplaceStatus(status) })
+}
+
 func (v *HomeView) handleStreamingEvent(event mastodon.Event) {
+	home := v.roots[titleHome]
+	if v.streamBroken {
+		v.streamBroken = false
+		if home != nil && !v.app.IsLoading() {
+			v.reloadTimeline(home)
+		}
+		// The backfill fetches everything newer than the top of the timeline,
+		// including this status, so skip the direct insert to keep ordering.
+		if _, ok := event.(*mastodon.UpdateEvent); ok {
+			return
+		}
+	}
+
 	switch e := event.(type) {
 	case *mastodon.UpdateEvent:
-		v.timeline.PrependToTimeline(0, []TimelineItem{StatusItem{Status: e.Status}})
-		v.app.vx.PostEvent(vaxis.Redraw{})
+		if home != nil {
+			home.Prepend([]TimelineItem{StatusItem{Status: e.Status}})
+		}
 
 	case *mastodon.UpdateEditEvent:
-		v.timeline.UpdateEdit(0, StatusItem{Status: e.Status})
-		v.app.vx.PostEvent(vaxis.Redraw{})
+		v.replaceStatusEverywhere(e.Status)
 
 	case *mastodon.NotificationEvent:
-		log.Printf("New Notification [%s] from @%s\n", e.Notification.Type, e.Notification.Account.Acct)
-		v.app.header.badge++
-		v.app.vx.PostEvent(vaxis.Redraw{})
+		v.onNotification(e.Notification)
 
 	case *mastodon.DeleteEvent:
-		v.timeline.DeleteFromTimeline(0, e.ID)
-		v.app.vx.PostEvent(vaxis.Redraw{})
-
-	case *mastodon.ErrorEvent:
-		log.Printf("Error %v\n", e.Error())
+		v.forEachTimeline(func(t *Timeline) { t.Delete(e.ID) })
 
 	default:
-		log.Printf("Streaming unhandled event type\n")
+		log.Printf("streaming: unhandled event %T", event)
+	}
+}
+
+func (v *HomeView) onNotification(n *mastodon.Notification) {
+	if n == nil {
+		return
+	}
+	log.Printf("New Notification [%s] from @%s", n.Type, n.Account.Acct)
+	if notifications := v.roots[titleNotifications]; notifications != nil {
+		notifications.Prepend([]TimelineItem{NotificationItem{Notification: n}})
+		if v.timeline.Root() == notifications {
+			v.markNotificationsRead(notifications)
+			return
+		}
+	}
+	v.app.header.IncrementBadge()
+	if v.app.config.Preferences.DesktopNotifications && n.Type == "mention" {
+		v.app.vx.Notify("Tuit", fmt.Sprintf("@%s mentioned you", n.Account.Acct))
 	}
 }
 
 func (v *HomeView) selectedStatusLinks() []LinkItem {
-	item, ok := v.timeline.SelectedItem().(StatusItem)
-	if !ok || item.Status == nil {
+	status := v.selectedStatus()
+	if status == nil {
 		return nil
 	}
-	status := item.Status
-	if status.Reblog != nil {
-		status = status.Reblog
-	}
+	status = originalStatus(status)
+
 	var items []LinkItem
 	seen := map[string]bool{}
-	for _, u := range utils.ExtractAllURLs(status.Content) {
-		if !seen[u] {
-			seen[u] = true
-			items = append(items, LinkItem{Label: u, URL: u})
+	for _, link := range utils.ExtractLinks(status.Content) {
+		if seen[link.URL] {
+			continue
 		}
+		seen[link.URL] = true
+		label := link.URL
+		if (link.Kind == utils.LinkKindMention || link.Kind == utils.LinkKindHashtag) && link.Text != "" {
+			label = link.Text
+		}
+		items = append(items, LinkItem{Label: label, URL: link.URL})
 	}
 	if status.Card != nil && status.Card.URL != "" && !seen[status.Card.URL] {
 		seen[status.Card.URL] = true
-		items = append(items, LinkItem{Label: status.Card.URL, URL: status.Card.URL})
+		label := status.Card.Title
+		if label == "" {
+			label = status.Card.URL
+		}
+		items = append(items, LinkItem{Label: label, URL: status.Card.URL})
 	}
 	for _, att := range status.MediaAttachments {
 		if att.URL == "" || seen[att.URL] {
 			continue
 		}
-		if att.Type != "image" && att.Type != "video" && att.Type != "gifv" {
-			continue
-		}
 		seen[att.URL] = true
-		label := att.Description
-		if label == "" {
-			if att.Type == "image" {
-				label = "[image]"
-			} else {
-				label = "[video]"
-			}
+		label := "[" + mediaLabel(att) + "]"
+		if att.Description != "" {
+			label += " " + att.Description
 		}
 		items = append(items, LinkItem{Label: label, URL: att.URL})
 	}
@@ -338,41 +505,43 @@ func (v *HomeView) selectedStatusLinks() []LinkItem {
 	return items
 }
 
+// windowOrigin returns the absolute screen position of a window.
+func windowOrigin(win vaxis.Window) (col, row int) {
+	for w := &win; w != nil; w = w.Parent {
+		col += w.Column
+		row += w.Row
+	}
+	return col, row
+}
 
 func (v *HomeView) Draw(win vaxis.Window) {
-	var (
-		leftRatio  = 2
-		rightRatio = 3
-	)
-	if leftRatio <= 0 {
-		leftRatio = 1
-	}
-	if rightRatio <= 0 {
-		leftRatio = 1
-	}
-
 	width, height := win.Size()
-	separatorStyle := vaxis.Style{
-		Foreground: vaxis.IndexColor(0),
+	v.bodyLeft, v.bodyTop = windowOrigin(win)
+	v.bodyWidth, v.bodyHeight = width, height
+
+	left, right := v.app.config.Preferences.Split()
+	split := width * left / (left + right)
+	if width >= 30 {
+		split = max(12, min(split, width-14))
 	}
+	v.split = split
+	v.app.split = split
+	v.app.header.SetFocus(v.FocusLabel())
 
-	total := leftRatio + rightRatio
-	split := width * leftRatio / total
-
-	timelineWin := win.New(0, 1, split, height)
+	timelineWin := win.New(0, 0, split, height)
 	detailWidth := max(0, width-split-2)
-	detailWin := win.New(split+2, 1, detailWidth, height)
+	detailWin := win.New(split+2, 0, detailWidth, height)
 
 	v.timeline.Draw(timelineWin, v.focusedView == 0)
 
 	selectedItem := v.timeline.SelectedItem()
 	isDetailFocused := v.focusedView == 1
 
-	if v.showingLinks {
-		v.linksView.Draw(detailWin, v.focusedView == 1)
-	} else if selectedItem != nil {
-		currentID := selectedItem.ID()
-		if currentID != v.lastSelectedID {
+	switch {
+	case v.showingLinks:
+		v.linksView.Draw(detailWin, isDetailFocused)
+	case selectedItem != nil:
+		if currentID := selectedItem.ID(); currentID != v.lastSelectedID {
 			v.statusView.ResetScroll()
 			v.lastSelectedID = currentID
 		}
@@ -381,92 +550,309 @@ func (v *HomeView) Draw(win vaxis.Window) {
 			v.statusView.Draw(detailWin, isDetailFocused, item.Status)
 		case AccountItem:
 			v.accountView.Draw(detailWin, isDetailFocused, item.Account)
-		default:
-			v.statusView.Draw(detailWin, isDetailFocused, nil)
+		case NotificationItem:
+			v.notificationView.Draw(detailWin, isDetailFocused, item.Notification)
 		}
-	} else {
-		v.statusView.Draw(detailWin, isDetailFocused, nil)
 	}
 
-	for row := 0; row < height-2; row++ {
-		win.SetCell(split, row+1, vaxis.Cell{
-			Character: vaxis.Character{
-				Grapheme: "│",
-			},
-			Style: separatorStyle,
+	separatorStyle := vaxis.Style{Foreground: vaxis.IndexColor(0)}
+	for row := 0; row < height; row++ {
+		win.SetCell(split, row, vaxis.Cell{
+			Character: vaxis.Character{Grapheme: "│"},
+			Style:     separatorStyle,
 		})
+	}
+
+	if v.picker != nil {
+		v.picker.Draw(win)
 	}
 }
 
-func (v *HomeView) HandleKey(key vaxis.Key) {
-	if v.showingLinks {
-		if key.Matches('h') {
-			v.focusedView = 0
-			return
+// closeLinksIfMoved hides the links view when the timeline selection moved
+// away from the status it was listing.
+func (v *HomeView) closeLinksIfMoved(prev TimelineItem) {
+	if !v.showingLinks {
+		return
+	}
+	if cur := v.timeline.SelectedItem(); cur != nil && (prev == nil || cur.ID() != prev.ID()) {
+		v.showingLinks = false
+	}
+}
+
+func (v *HomeView) HandleMouse(m vaxis.Mouse) {
+	if v.picker != nil || m.EventType == vaxis.EventRelease || m.EventType == vaxis.EventMotion {
+		return
+	}
+	col, row := m.Col-v.bodyLeft, m.Row-v.bodyTop
+	if row < 0 || row >= v.bodyHeight || col < 0 || col >= v.bodyWidth {
+		return
+	}
+	inTimeline := col < v.split
+	inDetail := col > v.split+1
+
+	switch m.Button {
+	case vaxis.MouseWheelUp, vaxis.MouseWheelDown:
+		delta := 1
+		if m.Button == vaxis.MouseWheelUp {
+			delta = -1
 		}
-		if key.Matches('l') {
+		switch {
+		case inTimeline:
+			prev := v.timeline.SelectedItem()
+			v.timeline.Move(delta)
+			v.closeLinksIfMoved(prev)
+		case inDetail && v.showingLinks:
+			v.linksView.Move(delta)
+		case inDetail:
+			v.statusView.Scroll(delta * 3)
+		}
+	case vaxis.MouseLeftButton:
+		switch {
+		case inTimeline:
+			v.focusedView = 0
+			prev := v.timeline.SelectedItem()
+			if v.timeline.SelectRow(row) {
+				v.closeLinksIfMoved(prev)
+			}
+		case inDetail:
 			v.focusedView = 1
-			return
 		}
-		if v.focusedView == 0 {
-			prevID := v.timeline.SelectedItem().ID()
-			v.timeline.HandleKey(key)
-			if item := v.timeline.SelectedItem(); item != nil && item.ID() != prevID {
-				v.showingLinks = false
-			}
-			return
+	}
+}
+
+func (v *HomeView) toggleContentWarning() {
+	if status := v.selectedStatus(); status != nil {
+		v.statusView.ToggleExpanded(originalStatus(status).ID)
+	}
+}
+
+// yank copies the selected link, or the selected status or profile URL, to
+// the clipboard.
+func (v *HomeView) yank() {
+	var url string
+	if v.showingLinks && v.focusedView == 1 {
+		if link, ok := v.linksView.Selected(); ok {
+			url = link.URL
 		}
-		result := v.linksView.HandleKey(key)
-		switch result {
-		case "open":
-			if err := utils.OpenBrowser(v.linksView.links[v.linksView.selected].URL); err != nil {
-				log.Printf("Failed to open URL: %v", err)
-			}
-		case "close":
-			v.showingLinks = false
-			v.focusedView = 0
+	} else if status := v.selectedStatus(); status != nil {
+		url = originalStatus(status).URL
+	} else if item, ok := v.timeline.SelectedItem().(AccountItem); ok {
+		url = item.URL
+	}
+	if url == "" {
+		return
+	}
+	v.app.vx.ClipboardPush(url)
+	v.app.Flash("Copied " + url)
+}
+
+func (v *HomeView) openOriginal() {
+	if status := v.selectedStatus(); status != nil {
+		v.app.OpenURL(originalStatus(status).URL)
+		return
+	}
+	if item, ok := v.timeline.SelectedItem().(AccountItem); ok {
+		v.app.OpenURL(item.URL)
+	}
+}
+
+func (v *HomeView) openLocal() {
+	server := v.app.config.Auth.Server
+	if status := v.selectedStatus(); status != nil {
+		original := originalStatus(status)
+		if original.URL != "" {
+			v.app.OpenURL(fmt.Sprintf("%s/@%s/%s", server, original.Account.Acct, original.ID))
 		}
 		return
 	}
-	if key.Matches(vaxis.KeyTab) {
+	if item, ok := v.timeline.SelectedItem().(AccountItem); ok {
+		v.app.OpenURL(fmt.Sprintf("%s/@%s", server, item.Acct))
+	}
+}
+
+func (v *HomeView) openLink() {
+	status := v.selectedStatus()
+	if status == nil {
+		return
+	}
+	original := originalStatus(status)
+	url := ""
+	if original.Card != nil {
+		url = original.Card.URL
+	}
+	if url == "" {
+		url = utils.ExtractFirstExternalURL(original.Content)
+	}
+	if url == "" {
+		v.app.Flash("No link in this status")
+		return
+	}
+	v.app.OpenURL(url)
+}
+
+func (v *HomeView) HandleKey(key vaxis.Key) {
+	km := v.app.keys
+	if v.picker != nil {
+		if v.picker.HandleKey(key, km) {
+			v.picker = nil
+		}
+		return
+	}
+	if v.vote != nil {
+		v.handleVoteKey(key)
+		return
+	}
+	if v.showingLinks {
+		v.handleLinksKey(key)
+		return
+	}
+
+	switch {
+	case km.Is(key, ActFocusNext):
 		v.focusedView = (v.focusedView + 1) % 2
-	} else if key.Matches('h') {
+	case km.Is(key, ActFocusTimeline):
 		v.focusedView = 0
-	} else if key.Matches('l') {
+	case km.Is(key, ActFocusDetail):
 		v.focusedView = 1
-	} else if key.Matches('r') && !v.app.loading && !v.isStreaming {
-		go v.reloadHomeTimeline()
-	} else if key.Matches('t') && !v.app.loading {
-		go v.getStatusContext()
-	} else if key.Matches('u') && !v.app.loading {
-		go v.goToAccountTimeline(false)
-	} else if key.Matches('U') && !v.app.loading {
-		go v.goToAccountTimeline(true)
-	} else if key.Matches('i') {
-		links := v.selectedStatusLinks()
-		if len(links) > 0 {
+	case km.Is(key, ActReload):
+		if !v.app.IsLoading() {
+			v.reload()
+		}
+	case km.Is(key, ActThread):
+		if !v.app.IsLoading() {
+			v.openThread()
+		}
+	case km.Is(key, ActProfile):
+		if !v.app.IsLoading() {
+			v.openProfile(false)
+		}
+	case km.Is(key, ActOwnProfile):
+		if !v.app.IsLoading() {
+			v.openProfile(true)
+		}
+	case km.Is(key, ActHome):
+		v.showRoot(homeSource())
+	case km.Is(key, ActNotifications):
+		v.showRoot(&notificationsSource{})
+	case km.Is(key, ActLocal):
+		v.showRoot(publicSource(true))
+	case km.Is(key, ActFederated):
+		v.showRoot(publicSource(false))
+	case km.Is(key, ActBookmarks):
+		v.showRoot(bookmarksSource())
+	case km.Is(key, ActFavourites):
+		v.showRoot(favouritesSource())
+	case km.Is(key, ActLists):
+		if !v.app.IsLoading() {
+			v.pickList()
+		}
+	case km.Is(key, ActHashtag):
+		v.promptHashtag()
+	case km.Is(key, ActSearch):
+		v.promptSearch()
+	case km.Is(key, ActFavourite):
+		v.toggleFavourite()
+	case km.Is(key, ActBoost):
+		v.toggleBoost()
+	case km.Is(key, ActBookmark):
+		v.toggleBookmark()
+	case km.Is(key, ActFollow):
+		v.toggleFollow()
+	case km.Is(key, ActVote):
+		v.startVote()
+	case km.Is(key, ActCompose):
+		if !v.app.IsLoading() {
+			v.compose(false)
+		}
+	case km.Is(key, ActReply):
+		if !v.app.IsLoading() {
+			v.compose(true)
+		}
+	case km.Is(key, ActLinks):
+		if links := v.selectedStatusLinks(); len(links) > 0 {
 			v.linksView.SetLinks(links)
 			v.showingLinks = true
 			v.focusedView = 1
-		}
-	} else if key.Matches('q') {
-		if len(v.timeline.timelines) <= 1 {
-			v.app.RequestQuit()
 		} else {
-			v.timeline.RemoveLastTimeline()
+			v.app.Flash("No links in this status")
 		}
-		return
-	} else {
+	case km.Is(key, ActToggleCW):
+		v.toggleContentWarning()
+	case km.Is(key, ActYank):
+		v.yank()
+	case km.Is(key, ActOpenOriginal):
+		v.openOriginal()
+	case km.Is(key, ActOpenLocal):
+		v.openLocal()
+	case km.Is(key, ActOpenLink):
+		v.openLink()
+	case km.Is(key, ActQuit):
+		if !v.pop() {
+			v.app.RequestQuit()
+		}
+	case km.Is(key, ActBack):
+		v.pop()
+	default:
 		if v.focusedView == 0 {
 			v.timeline.HandleKey(key)
-		} else {
-			selectedItem := v.timeline.SelectedItem()
-			if selectedItem != nil {
-				switch selectedItem.(type) {
-				case StatusItem:
-					v.statusView.HandleKey(key)
-				case AccountItem:
-					v.accountView.HandleKey(key)
+			return
+		}
+		switch v.timeline.SelectedItem().(type) {
+		case StatusItem:
+			v.statusView.HandleKey(key)
+		case AccountItem:
+			v.accountView.HandleKey(key)
+		case NotificationItem:
+			v.notificationView.HandleKey(key)
+		}
+	}
+}
+
+func (v *HomeView) handleLinksKey(key vaxis.Key) {
+	km := v.app.keys
+	switch {
+	case km.Is(key, ActFocusTimeline):
+		v.focusedView = 0
+		return
+	case km.Is(key, ActFocusDetail):
+		v.focusedView = 1
+		return
+	case km.Is(key, ActFocusNext):
+		v.focusedView = (v.focusedView + 1) % 2
+		return
+	case km.Is(key, ActYank):
+		v.yank()
+		return
+	case km.Is(key, ActToggleCW):
+		v.toggleContentWarning()
+		return
+	case km.Is(key, ActQuit), km.Is(key, ActBack), km.Is(key, ActLinks):
+		v.showingLinks = false
+		v.focusedView = 0
+		return
+	}
+
+	if v.focusedView == 0 {
+		prev := v.timeline.SelectedItem()
+		v.timeline.HandleKey(key)
+		v.closeLinksIfMoved(prev)
+		return
+	}
+
+	switch {
+	case km.Is(key, ActDown):
+		v.linksView.Move(1)
+	case km.Is(key, ActUp):
+		v.linksView.Move(-1)
+	case km.Is(key, ActSelect):
+		if link, ok := v.linksView.Selected(); ok {
+			v.app.OpenURL(link.URL)
+		}
+	default:
+		if key.Keycode >= '1' && key.Keycode <= '9' {
+			if v.linksView.Select(int(key.Keycode - '1')) {
+				if link, ok := v.linksView.Selected(); ok {
+					v.app.OpenURL(link.URL)
 				}
 			}
 		}

@@ -2,27 +2,28 @@ package tui
 
 import (
 	"fmt"
-	_ "image/jpeg"
-	_ "image/png"
-	"log"
+	"strings"
+	"time"
 
 	"git.sr.ht/~rockorager/vaxis"
 	"github.com/AbeEstrada/tuit/utils"
 	"github.com/mattn/go-mastodon"
 )
 
+const maxReadStatuses = 10000
+
 type TimelineView struct {
 	app          *App
-	timelines    []Timeline
-	index        int
+	stack        []*Timeline
+	nextID       int
 	onLoadMore   func()
 	readStatuses map[mastodon.ID]bool
+	viewHeight   int // rows available in the last Draw
+	viewWidth    int
 }
 
 func CreateTimelineView() *TimelineView {
 	return &TimelineView{
-		timelines:    []Timeline{},
-		index:        0,
 		readStatuses: make(map[mastodon.ID]bool),
 	}
 }
@@ -31,223 +32,263 @@ func (v *TimelineView) SetApp(app *App) {
 	v.app = app
 }
 
-func (v *TimelineView) setTitle() {
-	if v.index >= len(v.timelines) {
-		return
+func (v *TimelineView) markRead(id mastodon.ID) {
+	if len(v.readStatuses) >= maxReadStatuses {
+		v.readStatuses = make(map[mastodon.ID]bool)
 	}
-	timeline := &v.timelines[v.index]
-	v.app.header.SetBadgeVisible(v.index == 0)
-	switch {
-	case v.index == 0:
-		v.app.header.SetText("Home")
-	case timeline.Account != nil:
-		v.app.header.SetText("Home → " + timeline.Account.DisplayName)
-	default: // v.index != 0 && timeline.Account == nil
-		v.app.header.SetText("Home → Thread")
+	v.readStatuses[id] = true
+}
+
+// statusFlags returns compact markers for a status: content warning, media,
+// poll, and the user's own favourite and bookmark state.
+func statusFlags(s *mastodon.Status) string {
+	var b strings.Builder
+	if s.SpoilerText != "" || len(s.Filtered) > 0 || (s.Sensitive && len(s.MediaAttachments) > 0) {
+		b.WriteString("⚠")
 	}
+	if len(s.MediaAttachments) > 0 {
+		b.WriteString("▣")
+	}
+	if s.Poll != nil {
+		b.WriteString("▤")
+	}
+	if boolField(s.Favourited) {
+		b.WriteString("★")
+	}
+	if boolField(s.Bookmarked) {
+		b.WriteString("⚑")
+	}
+	return b.String()
+}
+
+func accountName(a *mastodon.Account) string {
+	if a.DisplayName != "" {
+		return a.DisplayName
+	}
+	return a.Username
+}
+
+// timestamp formats a row time: the full date and time by default, the time
+// alone in narrow panes, or a compact relative form when preferred.
+func (v *TimelineView) timestamp(t time.Time, now time.Time, width int) string {
+	if v.app.config.Preferences.Timestamp == "relative" {
+		return fmt.Sprintf("%5s", utils.FormatTimeShort(t.Local(), now))
+	}
+	if width < 60 {
+		return t.Local().Format("15:04")
+	}
+	return t.Local().Format("2006-01-02 15:04")
+}
+
+// rowSegments renders one list row: reply indentation, timestamp, type glyph,
+// account handle, and marker glyphs.
+func (v *TimelineView) rowSegments(item TimelineItem, timeline *Timeline, width int, now time.Time) []vaxis.Segment {
+	switch t := item.(type) {
+	case StatusItem:
+		if t.Status == nil {
+			return nil
+		}
+		display := t.Original()
+
+		indent := ""
+		if depth, ok := timeline.depths[t.ID()]; ok && depth > 0 {
+			indent = strings.Repeat(" ", min(depth, 6))
+		}
+
+		glyph := " "
+		switch {
+		case timeline.focalID != "" && t.ID() == timeline.focalID:
+			glyph = "▶"
+		case t.Reblog != nil:
+			glyph = "♺"
+		case t.InReplyToID != nil:
+			glyph = "↩"
+		}
+
+		segs := []vaxis.Segment{
+			{Text: indent + v.timestamp(t.CreatedAt, now, width) + " ", Style: dimStyle},
+			{Text: glyph + " "},
+			{Text: "@" + t.Account.Acct},
+		}
+		if flags := statusFlags(display); flags != "" {
+			segs = append(segs, vaxis.Segment{Text: " " + flags})
+		}
+		return segs
+
+	case NotificationItem:
+		if t.Notification == nil {
+			return nil
+		}
+		return []vaxis.Segment{
+			{Text: v.timestamp(t.CreatedAt, now, width) + " ", Style: dimStyle},
+			{Text: notificationGlyph(t.Type) + " "},
+			{Text: "@" + t.Account.Acct},
+			{Text: " " + notificationVerb(t.Type), Style: dimStyle},
+		}
+
+	case AccountItem:
+		if t.Account == nil {
+			return nil
+		}
+		return []vaxis.Segment{{Text: "@" + t.Acct}}
+	}
+	return nil
 }
 
 func (v *TimelineView) Draw(win vaxis.Window, focused bool) {
 	width, height := win.Size()
+	v.viewHeight, v.viewWidth = height, width
 
-	if v.index >= len(v.timelines) || len(v.timelines[v.index].Items) == 0 {
-		win.Println(0, vaxis.Segment{Text: "Loading..."})
+	timeline := v.Current()
+	if timeline == nil || len(timeline.Items) == 0 {
+		text := "Nothing here yet"
+		if timeline == nil || v.app.IsLoading() {
+			text = "Loading..."
+		}
+		win.Println(0, vaxis.Segment{Text: text, Style: dimStyle})
 		return
 	}
 
-	timeline := &v.timelines[v.index]
 	items := timeline.Items
 	selected := timeline.Selected
-	selectedID := selected.ID()
-	scrollOffset := timeline.scrollOffset
+	now := time.Now()
 
 	y := 0
-	for i := scrollOffset; i < len(items) && y < height-2; i++ {
+	for i := timeline.scrollOffset; i < len(items) && y < height; i++ {
 		item := items[i]
-
-		var displayText string
-
-		switch t := item.(type) {
-		case StatusItem:
-			createdAt := t.CreatedAt.Local()
-			timestamp := createdAt.Format("2006-01-02 15:04")
-			if width < 60 {
-				timestamp = createdAt.Format("15:04")
-			}
-
-			statusType := " "
-			if t.Reblog != nil {
-				statusType = "♺"
-			} else if t.InReplyToID != nil {
-				statusType = "↩"
-			}
-			displayText = fmt.Sprintf("%s %s @%s", timestamp, statusType, t.Account.Acct)
-
-		case AccountItem:
-			displayText = fmt.Sprintf("@%s", t.Acct)
-
-		default:
+		segs := v.rowSegments(item, timeline, width, now)
+		if segs == nil {
 			continue
 		}
 
-		var attr vaxis.AttributeMask
-		isSelected := item.ID() == selectedID && focused
-		if v.readStatuses[item.ID()] && !isSelected {
-			attr |= vaxis.AttrDim
+		isSelected := selected != nil && item.ID() == selected.ID()
+		rowWin := win.New(0, y, width, 1)
+		switch {
+		case isSelected && focused:
+			rowWin.Fill(vaxis.Cell{
+				Character: vaxis.Character{Grapheme: " ", Width: 1},
+				Style:     vaxis.Style{Attribute: vaxis.AttrReverse},
+			})
+			for s := range segs {
+				segs[s].Style.Attribute = segs[s].Style.Attribute&^vaxis.AttrDim | vaxis.AttrReverse
+			}
+		case isSelected:
+			for s := range segs {
+				segs[s].Style.Attribute = segs[s].Style.Attribute&^vaxis.AttrDim | vaxis.AttrBold
+				segs[s].Style.UnderlineStyle = vaxis.UnderlineSingle
+			}
+		case v.readStatuses[item.ID()]:
+			for s := range segs {
+				segs[s].Style.Attribute = segs[s].Style.Attribute&^vaxis.AttrBold | vaxis.AttrDim
+			}
 		}
-		if isSelected {
-			attr |= vaxis.AttrReverse
-		}
-
-		win.Println(y, vaxis.Segment{
-			Text:  displayText,
-			Style: vaxis.Style{Attribute: attr},
-		})
+		rowWin.PrintTruncate(0, segs...)
 		y++
 	}
 }
 
 func (v *TimelineView) HandleKey(key vaxis.Key) {
-	if v.timelines == nil || v.index >= len(v.timelines) || len(v.timelines[v.index].Items) == 0 {
+	timeline := v.Current()
+	if timeline == nil || len(timeline.Items) == 0 {
 		return
 	}
 
-	timeline := &v.timelines[v.index]
-	items := timeline.Items
-	selected := timeline.Selected
-	selectedID := selected.ID()
-	scrollOffset := timeline.scrollOffset
+	km := v.app.keys
+	current := timeline.SelectedIndex()
+	last := len(timeline.Items) - 1
+	jump := max(1, v.viewHeight/2)
 
-	currentIndex := -1
-	if selected != nil {
-		for i, item := range items {
-			if item.ID() == selectedID {
-				currentIndex = i
-				break
-			}
-		}
-	}
-
-	newIndex := currentIndex
+	target := current
 	switch {
-	case key.Matches('j'):
-		if currentIndex == -1 {
-			newIndex = 0
+	case km.Is(key, ActDown):
+		if current < 0 {
+			target = 0
 		} else {
-			newIndex++
+			target = current + 1
 		}
-	case key.Matches('k'):
-		if currentIndex == -1 {
-			newIndex = len(items) - 1
+	case km.Is(key, ActUp):
+		if current < 0 {
+			target = last
 		} else {
-			newIndex--
+			target = current - 1
 		}
-	case key.MatchString("Ctrl+d"):
-		_, height := v.app.vx.Window().Size()
-		jump := height / 2
-		if currentIndex == -1 {
-			newIndex = jump
+	case km.Is(key, ActPageDown):
+		if current < 0 {
+			target = jump
 		} else {
-			newIndex += jump
+			target = current + jump
 		}
-	case key.MatchString("Ctrl+u"):
-		_, height := v.app.vx.Window().Size()
-		jump := height / 2
-		if currentIndex == -1 {
-			newIndex = 0
+	case km.Is(key, ActPageUp):
+		if current < 0 {
+			target = 0
 		} else {
-			newIndex -= jump
+			target = current - jump
 		}
-	case key.Matches('g'):
-		newIndex = 0
-	case key.Matches('G'):
-		newIndex = len(items) - 1
-	case key.Matches('O'):
-		if status, ok := selected.(StatusItem); ok {
-			var url string
-			if status.Reblog != nil && status.Reblog.URL != "" {
-				url = status.Reblog.URL
-			} else if status.URL != "" {
-				url = status.URL
-			}
-			if url != "" {
-				if err := utils.OpenBrowser(url); err != nil {
-					log.Printf("Failed to open URL: %v", err)
-				}
-			}
-		}
-	case key.Matches('o'):
-		if status, ok := selected.(StatusItem); ok {
-			var url string
-			if status.Reblog != nil && status.Reblog.URL != "" {
-				url = fmt.Sprintf("%s/@%s/%s", v.app.config.Auth.Server, status.Reblog.Account.Acct, status.Reblog.ID)
-			} else if status.URL != "" {
-				statusID := status.ID()
-				url = fmt.Sprintf("%s/@%s/%s", v.app.config.Auth.Server, status.Account.Acct, statusID)
-			}
-			if url != "" {
-				if err := utils.OpenBrowser(url); err != nil {
-					log.Printf("Failed to open URL: %v", err)
-				}
-			}
-		} else if account, ok := selected.(AccountItem); ok {
-			if account.URL != "" {
-				if err := utils.OpenBrowser(account.URL); err != nil {
-					log.Printf("Failed to open URL: %v", err)
-				}
-			}
-		}
-		return
-	case key.Matches('v'):
-		if status, ok := selected.(StatusItem); ok {
-			var url string
-			if status.Reblog != nil && status.Reblog.Card != nil && status.Reblog.Card.URL != "" {
-				url = status.Reblog.Card.URL
-			} else if status.Card != nil && status.Card.URL != "" {
-				url = status.Card.URL
-			}
-			if url == "" {
-				if status.Reblog != nil {
-					url = utils.ExtractFirstExternalURL(status.Reblog.Content)
-				}
-				if url == "" {
-					url = utils.ExtractFirstExternalURL(status.Content)
-				}
-			}
-			if url != "" {
-				if err := utils.OpenBrowser(url); err != nil {
-					log.Printf("Failed to open URL: %v", err)
-				}
-			} else {
-				log.Printf("No URL available to open")
-			}
-		}
-		return
+	case km.Is(key, ActTop):
+		target = 0
+	case km.Is(key, ActBottom):
+		target = last
 	default:
 		return
 	}
+	v.moveTo(timeline, target)
+}
 
-	if newIndex < 0 {
-		newIndex = 0
-	}
-	if newIndex >= len(items) {
-		if v.onLoadMore != nil && !v.app.loading {
-			go v.onLoadMore()
-		}
+// Move shifts the selection by delta rows.
+func (v *TimelineView) Move(delta int) {
+	timeline := v.Current()
+	if timeline == nil || len(timeline.Items) == 0 {
 		return
 	}
+	v.moveTo(timeline, max(0, timeline.SelectedIndex())+delta)
+}
 
-	_, height := v.app.vx.Window().Size()
-	if newIndex >= scrollOffset+height-4 {
-		v.timelines[v.index].scrollOffset = newIndex - (height - 5)
+// SelectRow selects the item drawn on the given row of the view.
+func (v *TimelineView) SelectRow(row int) bool {
+	timeline := v.Current()
+	if timeline == nil || row < 0 {
+		return false
 	}
-	if newIndex < scrollOffset {
-		v.timelines[v.index].scrollOffset = newIndex
+	index := timeline.scrollOffset + row
+	if index >= len(timeline.Items) {
+		return false
 	}
+	timeline.Selected = timeline.Items[index]
+	v.markRead(timeline.Selected.ID())
+	return true
+}
 
-	newSelected := items[newIndex]
-	if selected == nil || newSelected.ID() != selected.ID() {
-		v.timelines[v.index].Selected = newSelected
+// moveTo selects the item at target, requesting more items when moving past
+// the end, and keeps the selection visible.
+func (v *TimelineView) moveTo(timeline *Timeline, target int) {
+	items := timeline.Items
+	if target >= len(items) {
+		if v.onLoadMore != nil && !v.app.IsLoading() && !timeline.exhausted {
+			v.onLoadMore()
+		}
+		target = len(items) - 1
 	}
-	v.readStatuses[newSelected.ID()] = true
+	if target < 0 {
+		target = 0
+	}
+	timeline.Selected = items[target]
+	v.markRead(items[target].ID())
+	v.scrollToSelection(timeline)
+}
+
+// scrollToSelection adjusts the scroll offset so the selection is visible.
+func (v *TimelineView) scrollToSelection(timeline *Timeline) {
+	if v.viewHeight <= 0 {
+		return
+	}
+	index := timeline.SelectedIndex()
+	if index < 0 {
+		return
+	}
+	if index >= timeline.scrollOffset+v.viewHeight {
+		timeline.scrollOffset = index - v.viewHeight + 1
+	}
+	if index < timeline.scrollOffset {
+		timeline.scrollOffset = index
+	}
 }

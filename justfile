@@ -1,5 +1,6 @@
 PKG_NAME := `basename $(go list)`
-BUILD_FLAGS := "-ldflags=\"-s -w\" -trimpath"
+VERSION := `git describe --tags --always --dirty 2>/dev/null || echo dev`
+BUILD_FLAGS := "-trimpath -ldflags=\"-s -w -X github.com/AbeEstrada/tuit/constants.AppVersion=" + VERSION + "\""
 
 PREFIX := env("PREFIX", "/usr/local")
 
@@ -16,5 +17,17 @@ uninstall:
     rm -f {{PREFIX}}/bin/{{PKG_NAME}}
 
 clean:
-    rm -f {{PKG_NAME}}
+    rm -f {{PKG_NAME}} {{PKG_NAME}}-race
 
+test:
+    go test ./...
+
+lint:
+    test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+    go vet ./...
+
+fmt:
+    gofmt -w .
+
+race:
+    go build -race -o {{PKG_NAME}}-race .

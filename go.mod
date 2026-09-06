@@ -6,7 +6,7 @@ require (
 	git.sr.ht/~rockorager/vaxis v0.16.0
 	github.com/mattn/go-mastodon v0.0.13
 	golang.org/x/image v0.44.0
-	golang.org/x/text v0.40.0
+	golang.org/x/net v0.57.0
 )
 
 require (

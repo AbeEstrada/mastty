@@ -50,3 +50,24 @@ func FormatTimeSince(t time.Time) string {
 		return fmt.Sprintf("%d years ago", years)
 	}
 }
+
+// FormatTimeShort renders t compactly for list rows: "now", "5m", "2h", "3d",
+// then "Jan 2" within the year and "2024" beyond it. The result is at most
+// five characters wide.
+func FormatTimeShort(t, now time.Time) string {
+	diff := now.Sub(t)
+	switch {
+	case diff < time.Minute:
+		return "now"
+	case diff < time.Hour:
+		return fmt.Sprintf("%dm", int(diff.Minutes()))
+	case diff < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(diff.Hours()))
+	case diff < 7*24*time.Hour:
+		return fmt.Sprintf("%dd", int(diff.Hours()/24))
+	case t.Year() == now.Year():
+		return t.Format("Jan 2")
+	default:
+		return t.Format("2006")
+	}
+}

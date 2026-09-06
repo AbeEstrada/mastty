@@ -9,8 +9,14 @@ import (
 	"github.com/mattn/go-mastodon"
 )
 
+const (
+	profileAvatarWidth  = 24
+	profileAvatarHeight = 12
+)
+
 type AccountView struct {
-	app *App
+	app           *App
+	Relationships map[mastodon.ID]*mastodon.Relationship
 }
 
 func CreateAccountView() *AccountView {
@@ -23,85 +29,68 @@ func (v *AccountView) SetApp(app *App) {
 
 func (v *AccountView) Draw(win vaxis.Window, focused bool, account *mastodon.Account) {
 	if account == nil {
-		win.Println(0, vaxis.Segment{Text: ""})
 		return
 	}
 
 	width, height := win.Size()
 	y := 0
 
-	avatarWidth := 24
-	avatarHeight := 12
-	avatarURL := account.AvatarStatic
-
-	vxImage, cached := utils.ImageCache.Get(avatarURL, avatarWidth, avatarHeight)
-	if cached {
-		if width > avatarWidth {
-			imgWin := win.New(0, y, avatarWidth, avatarHeight)
-			vxImage.Draw(imgWin)
+	if utils.ImageCache.Enabled() && width > profileAvatarWidth {
+		if vxImage, cached := utils.ImageCache.Get(account.AvatarStatic, profileAvatarWidth, profileAvatarHeight); cached {
+			vxImage.Draw(win.New(0, y, profileAvatarWidth, profileAvatarHeight))
 		}
-	} else {
-		utils.ImageCache.LoadAsync(avatarURL)
 	}
 
-	metaX := avatarWidth + 1
+	metaX := profileAvatarWidth + 1
 	metaY := 0
-	metaWin := win.New(metaX, metaY, width-metaX, avatarHeight)
-	metaWin.Println(
-		metaY,
-		vaxis.Segment{
-			Text:  account.DisplayName,
-			Style: vaxis.Style{Attribute: vaxis.AttrBold},
-		},
-	)
-	metaY += 1
-	metaWin.Println(
-		metaY,
-		vaxis.Segment{
-			Text:  fmt.Sprintf("@%s", account.Acct),
-			Style: vaxis.Style{Attribute: vaxis.AttrBold},
-		},
-	)
-	metaY += 1
+	metaWin := win.New(metaX, 0, width-metaX, profileAvatarHeight)
+	metaWin.PrintTruncate(metaY, vaxis.Segment{
+		Text:  account.DisplayName,
+		Style: vaxis.Style{Attribute: vaxis.AttrBold},
+	})
+	metaY++
+	metaWin.PrintTruncate(metaY, vaxis.Segment{
+		Text:  fmt.Sprintf("@%s", account.Acct),
+		Style: vaxis.Style{Attribute: vaxis.AttrBold},
+	})
+	metaY++
 	if account.Bot {
-		metaWin.Println(
-			metaY,
-			vaxis.Segment{
-				Text: "Automated",
-			},
-		)
-		metaY += 1
+		metaWin.PrintTruncate(metaY, vaxis.Segment{Text: "Automated"})
+		metaY++
 	}
-	metaWin.Println(
-		metaY,
-		vaxis.Segment{
-			Text: fmt.Sprintf("Joined %s", account.CreatedAt.Local().Format("Jan 2, 2006")),
-		},
-	)
+	metaWin.PrintTruncate(metaY, vaxis.Segment{
+		Text: fmt.Sprintf("Joined %s", account.CreatedAt.Local().Format("Jan 2, 2006")),
+	})
 	metaY += 2
-	metaWin.Println(
-		metaY,
-		vaxis.Segment{
-			Text: fmt.Sprintf("%s posts", utils.FormatNumber(account.StatusesCount)),
-		},
-	)
-	metaY += 1
-	metaWin.Println(
-		metaY,
-		vaxis.Segment{
-			Text: fmt.Sprintf("%s following", utils.FormatNumber(account.FollowingCount)),
-		},
-	)
-	metaY += 1
-	metaWin.Println(
-		metaY,
-		vaxis.Segment{
-			Text: fmt.Sprintf("%s followers", utils.FormatNumber(account.FollowersCount)),
-		},
-	)
-	metaY += 1
+	metaWin.PrintTruncate(metaY, vaxis.Segment{Text: fmt.Sprintf("%s posts", utils.FormatNumber(account.StatusesCount))})
+	metaY++
+	metaWin.PrintTruncate(metaY, vaxis.Segment{Text: fmt.Sprintf("%s following", utils.FormatNumber(account.FollowingCount))})
+	metaY++
+	metaWin.PrintTruncate(metaY, vaxis.Segment{Text: fmt.Sprintf("%s followers", utils.FormatNumber(account.FollowersCount))})
+	if rel := v.Relationships[account.ID]; rel != nil {
+		var parts []string
+		switch {
+		case rel.Following:
+			parts = append(parts, "✓ Following")
+		case rel.Requested:
+			parts = append(parts, "Follow requested")
+		}
+		if rel.FollowedBy {
+			parts = append(parts, "Follows you")
+		}
+		if rel.Blocking {
+			parts = append(parts, "Blocked")
+		}
+		if rel.Muting {
+			parts = append(parts, "Muted")
+		}
+		if len(parts) > 0 {
+			metaY++
+			metaWin.PrintTruncate(metaY, vaxis.Segment{Text: strings.Join(parts, " · "), Style: vaxis.Style{Foreground: vaxis.IndexColor(2)}})
+		}
+	}
 
-	y += avatarHeight
+	y += profileAvatarHeight
 
 	fieldsWin := win.New(0, y, width, len(account.Fields))
 	for i, field := range account.Fields {
@@ -132,7 +121,7 @@ func (v *AccountView) Draw(win vaxis.Window, focused bool, account *mastodon.Acc
 			}
 		}
 
-		fieldsWin.Println(
+		fieldsWin.PrintTruncate(
 			i,
 			vaxis.Segment{Text: verified, Style: verifiedStyle},
 			vaxis.Segment{
@@ -141,17 +130,14 @@ func (v *AccountView) Draw(win vaxis.Window, focused bool, account *mastodon.Acc
 			},
 			vaxis.Segment{Text: flatValue, Style: valueStyle},
 		)
-		y += 1
+		y++
 	}
-	y += 1
+	y++
 
-	contentHeight := height - y
-	contentWin := win.New(0, y, width, contentHeight)
-	content := utils.ParseStatus(account.Note, nil)
-	_, rows := contentWin.Wrap(content...)
-
-	y += rows
-
+	if y < height {
+		contentWin := win.New(0, y, width, height-y)
+		contentWin.Wrap(utils.ParseStatus(account.Note, nil)...)
+	}
 }
 
 func (v *AccountView) HandleKey(key vaxis.Key) {}

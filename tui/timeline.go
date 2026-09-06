@@ -1,188 +1,299 @@
 package tui
 
-import "github.com/mattn/go-mastodon"
+import (
+	"strings"
 
+	"github.com/mattn/go-mastodon"
+)
+
+// Timeline is one entry in the navigation stack: a root timeline (home,
+// notifications, local, ...) or a thread, profile, or search pushed on top.
 type Timeline struct {
+	id           int
+	Source       Source
 	Items        []TimelineItem
 	Selected     TimelineItem
-	Account      *mastodon.Account
 	scrollOffset int
+	exhausted    bool // no older pages are available
+
+	// Thread layout: the status the thread was opened from and the reply depth
+	// of every status, used to indent rows.
+	focalID mastodon.ID
+	depths  map[mastodon.ID]int
 }
 
-func (v *TimelineView) AddTimeline(items []TimelineItem, selected TimelineItem, account *mastodon.Account) {
-	if len(items) == 0 {
-		if account == nil {
-			return
+func (t *Timeline) Title() string {
+	if t.Source == nil {
+		return ""
+	}
+	return t.Source.Title()
+}
+
+// NewestID returns the ID of the first status or notification, which is what
+// since_id pagination needs.
+func (t *Timeline) NewestID() (mastodon.ID, bool) {
+	for _, item := range t.Items {
+		switch item.(type) {
+		case StatusItem, NotificationItem:
+			return item.ID(), true
 		}
 	}
+	return "", false
+}
 
-	var selectedItem TimelineItem
+// SelectedIndex returns the position of the selected item, or -1.
+func (t *Timeline) SelectedIndex() int {
+	if t.Selected == nil {
+		return -1
+	}
+	id := t.Selected.ID()
+	for i, item := range t.Items {
+		if item.ID() == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// SetItems replaces the contents, keeping the selection (or the given one) when
+// it is still present and otherwise selecting the first item.
+func (t *Timeline) SetItems(items []TimelineItem, selected TimelineItem) {
+	var target mastodon.ID
+	switch {
+	case selected != nil:
+		target = selected.ID()
+	case t.Selected != nil:
+		target = t.Selected.ID()
+	}
+
+	t.Items = items
+	t.exhausted = false
+	t.scrollOffset = 0
+	t.Selected = nil
 	if len(items) > 0 {
-		selectedItem = items[0]
+		t.Selected = items[0]
 	}
-
-	if selected != nil {
-		targetID := selected.ID()
-		for _, item := range items {
-			if item.ID() == targetID {
-				selectedItem = item
-				break
-			}
-		}
-	}
-
-	t := Timeline{
-		Items:        items,
-		Selected:     selectedItem,
-		scrollOffset: 0,
-	}
-
-	if account != nil {
-		t.Account = account
-	}
-
-	if selectedItem != nil {
-		v.readStatuses[selectedItem.ID()] = true
-	}
-
-	v.timelines = append(v.timelines, t)
-	v.index = len(v.timelines) - 1
-	v.setTitle()
-}
-
-func (v *TimelineView) RemoveLastTimeline() {
-	if len(v.timelines) <= 1 {
-		return
-	}
-
-	v.timelines = v.timelines[:len(v.timelines)-1]
-
-	if v.index >= len(v.timelines) {
-		v.index = len(v.timelines) - 1
-	}
-
-	v.setTitle()
-}
-
-func (v *TimelineView) UpdateTimeline(index int, newItems []TimelineItem, prepend bool) {
-	if len(newItems) == 0 || index < 0 || index >= len(v.timelines) {
-		return
-	}
-
-	timeline := &v.timelines[index]
-	items := timeline.Items
-	selected := timeline.Selected
-
-	// Create a set of existing IDs for deduplication
-	existingIDs := make(map[mastodon.ID]struct{})
 	for _, item := range items {
-		existingIDs[item.ID()] = struct{}{}
-	}
-
-	var freshItems []TimelineItem
-	for _, item := range newItems {
-		if _, exists := existingIDs[item.ID()]; !exists {
-			freshItems = append(freshItems, item)
+		if item.ID() == target {
+			t.Selected = item
+			break
 		}
 	}
+	if layout, ok := t.Source.(threadLayout); ok {
+		t.focalID, t.depths = layout.Layout()
+	}
+}
 
-	if len(freshItems) == 0 {
-		return
+// insert adds the items not already present, at the front or the back, and
+// returns how many were added.
+func (t *Timeline) insert(newItems []TimelineItem, prepend bool) int {
+	if len(newItems) == 0 {
+		return 0
+	}
+	existing := make(map[mastodon.ID]struct{}, len(t.Items))
+	for _, item := range t.Items {
+		existing[item.ID()] = struct{}{}
+	}
+	fresh := make([]TimelineItem, 0, len(newItems))
+	for _, item := range newItems {
+		if _, dup := existing[item.ID()]; dup {
+			continue
+		}
+		existing[item.ID()] = struct{}{}
+		fresh = append(fresh, item)
+	}
+	if len(fresh) == 0 {
+		return 0
 	}
 
 	if prepend {
-		items = append(freshItems, items...)
+		t.Items = append(fresh, t.Items...)
+		// Keep the viewport anchored on what the user was looking at.
+		if t.scrollOffset > 0 {
+			t.scrollOffset += len(fresh)
+		}
 	} else {
-		items = append(items, freshItems...)
+		t.Items = append(t.Items, fresh...)
 	}
+	if t.Selected == nil {
+		t.Selected = t.Items[0]
+	}
+	return len(fresh)
+}
 
-	v.timelines[index].Items = items
+func (t *Timeline) Prepend(items []TimelineItem) int { return t.insert(items, true) }
+func (t *Timeline) Append(items []TimelineItem) int  { return t.insert(items, false) }
 
-	if selected != nil {
-		targetID := selected.ID()
-		for _, item := range items {
-			if item.ID() == targetID {
-				v.timelines[index].Selected = item
-				break
+// Replace swaps in an item with the same ID and reports whether it was found.
+func (t *Timeline) Replace(item TimelineItem) bool {
+	if item == nil {
+		return false
+	}
+	for i, existing := range t.Items {
+		if existing.ID() == item.ID() {
+			t.Items[i] = item
+			if t.Selected != nil && t.Selected.ID() == item.ID() {
+				t.Selected = item
 			}
+			return true
 		}
 	}
+	return false
 }
 
-func (v *TimelineView) PrependToTimeline(index int, newItems []TimelineItem) {
-	v.UpdateTimeline(index, newItems, true)
-}
-
-func (v *TimelineView) AppendToTimeline(index int, newItems []TimelineItem) {
-	v.UpdateTimeline(index, newItems, false)
-}
-
-func (v *TimelineView) UpdateEdit(index int, newItem TimelineItem) {
-	if newItem == nil || index < 0 || index >= len(v.timelines) {
-		return
+// ReplaceStatus swaps in an updated status wherever it appears: directly,
+// inside a boost that wraps it, or as the subject of a notification.
+func (t *Timeline) ReplaceStatus(updated *mastodon.Status) bool {
+	if updated == nil {
+		return false
 	}
-
-	timeline := &v.timelines[index]
-	items := timeline.Items
-	selected := timeline.Selected
-
-	var selectedID mastodon.ID
-	if selected != nil {
-		selectedID = selected.ID()
-	}
-
-	for i, item := range items {
-		if item.ID() == newItem.ID() {
-			v.timelines[index].Items[i] = newItem
-			if selected != nil && selectedID == newItem.ID() {
-				v.timelines[index].Selected = newItem
+	changed := false
+	for i, item := range t.Items {
+		var replacement TimelineItem
+		switch it := item.(type) {
+		case StatusItem:
+			switch {
+			case it.Status == nil:
+				continue
+			case it.Status.ID == updated.ID:
+				replacement = StatusItem{Status: updated}
+			case it.Status.Reblog != nil && it.Status.Reblog.ID == updated.ID:
+				wrapper := *it.Status
+				wrapper.Reblog = updated
+				replacement = StatusItem{Status: &wrapper}
+			default:
+				continue
 			}
-			break
+		case NotificationItem:
+			if it.Notification == nil || it.Status == nil || it.Status.ID != updated.ID {
+				continue
+			}
+			n := *it.Notification
+			n.Status = updated
+			replacement = NotificationItem{Notification: &n}
+		default:
+			continue
 		}
+		t.Items[i] = replacement
+		if t.Selected != nil && t.Selected.ID() == item.ID() {
+			t.Selected = replacement
+		}
+		changed = true
 	}
+	return changed
 }
 
-func (v *TimelineView) DeleteFromTimeline(index int, targetID mastodon.ID) {
-	if index < 0 || index >= len(v.timelines) {
-		return
-	}
-
-	timeline := &v.timelines[index]
-	items := timeline.Items
-	selected := timeline.Selected
-
-	if len(items) == 0 {
-		return
-	}
-
-	var deleteIndex int = -1
-	for i, item := range items {
+// Delete removes the item with the given ID, moving the selection to a
+// neighbor when it was selected.
+func (t *Timeline) Delete(targetID mastodon.ID) bool {
+	index := -1
+	for i, item := range t.Items {
 		if item.ID() == targetID {
-			deleteIndex = i
+			index = i
 			break
 		}
 	}
-
-	if deleteIndex == -1 {
-		return
+	if index == -1 {
+		return false
 	}
 
-	if selected != nil && selected.ID() == targetID {
-		if len(items) == 1 {
-			v.timelines[index].Selected = nil
-		} else if deleteIndex == 0 {
-			v.timelines[index].Selected = items[1]
-		} else {
-			v.timelines[index].Selected = items[deleteIndex-1]
+	remaining := make([]TimelineItem, 0, len(t.Items)-1)
+	remaining = append(remaining, t.Items[:index]...)
+	remaining = append(remaining, t.Items[index+1:]...)
+	t.Items = remaining
+
+	if t.Selected != nil && t.Selected.ID() == targetID {
+		switch {
+		case len(remaining) == 0:
+			t.Selected = nil
+		case index >= len(remaining):
+			t.Selected = remaining[len(remaining)-1]
+		default:
+			t.Selected = remaining[index]
 		}
 	}
+	if t.scrollOffset > 0 && t.scrollOffset >= len(remaining) {
+		t.scrollOffset = max(0, len(remaining)-1)
+	}
+	return true
+}
 
-	v.timelines[index].Items = append(items[:deleteIndex], items[deleteIndex+1:]...)
+// NewTimeline creates an empty timeline for a source with a stable id.
+func (v *TimelineView) NewTimeline(source Source) *Timeline {
+	v.nextID++
+	return &Timeline{id: v.nextID, Source: source}
+}
+
+// SetRoot replaces the whole stack with one timeline.
+func (v *TimelineView) SetRoot(t *Timeline) {
+	v.stack = []*Timeline{t}
+	v.afterChange(t)
+}
+
+// Push shows t on top of the current timeline.
+func (v *TimelineView) Push(t *Timeline) {
+	v.stack = append(v.stack, t)
+	v.afterChange(t)
+}
+
+// Pop returns to the previous timeline and reports whether it did.
+func (v *TimelineView) Pop() bool {
+	if len(v.stack) <= 1 {
+		return false
+	}
+	v.stack = v.stack[:len(v.stack)-1]
+	v.afterChange(v.stack[len(v.stack)-1])
+	return true
+}
+
+func (v *TimelineView) afterChange(t *Timeline) {
+	if t.Selected != nil {
+		v.markRead(t.Selected.ID())
+	}
+	v.scrollToSelection(t)
+	v.setTitle()
+}
+
+// Current returns the timeline being shown, or nil before the first load.
+func (v *TimelineView) Current() *Timeline {
+	if len(v.stack) == 0 {
+		return nil
+	}
+	return v.stack[len(v.stack)-1]
+}
+
+// Root returns the bottom of the stack, or nil before the first load.
+func (v *TimelineView) Root() *Timeline {
+	if len(v.stack) == 0 {
+		return nil
+	}
+	return v.stack[0]
+}
+
+// Depth is the number of timelines on the stack.
+func (v *TimelineView) Depth() int {
+	return len(v.stack)
+}
+
+// Stack returns the timelines from root to current.
+func (v *TimelineView) Stack() []*Timeline {
+	return v.stack
 }
 
 func (v *TimelineView) SelectedItem() TimelineItem {
-	if v.index >= len(v.timelines) {
+	t := v.Current()
+	if t == nil {
 		return nil
 	}
-	return v.timelines[v.index].Selected
+	return t.Selected
+}
+
+func (v *TimelineView) setTitle() {
+	titles := make([]string, 0, len(v.stack))
+	for _, t := range v.stack {
+		titles = append(titles, t.Title())
+	}
+	v.app.header.SetText(strings.Join(titles, " → "))
+	root := v.Root()
+	v.app.header.SetBadgeVisible(root == nil || root.Title() != titleNotifications)
 }
